@@ -23,6 +23,8 @@ fn main() {
         PathBuf::from(format!("{}/icicle/", deps_dir.display()))
     };
     config
+        .define("HASH", "OFF")
+        .define("CPU_BACKEND", "OFF")
         .define("CMAKE_INSTALL_PREFIX", &icicle_install_dir);
 
     // build (or pull and build) cuda backend if feature enabled.

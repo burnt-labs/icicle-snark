@@ -11,6 +11,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 include(cmake/field.cmake)
 include(cmake/curve.cmake)
+include(cmake/ring.cmake)
+include(cmake/hash.cmake)
 
 # Prevent build if both SANITIZE and CUDA_BACKEND are enabled
 if(SANITIZE AND CUDA_BACKEND)
@@ -28,8 +30,16 @@ option(VULKAN_BACKEND "Branch/commit to pull for VULKAN backend or `local` if un
 
 # features that some fields/curves have and some don't.
 option(NTT "Build NTT" ON)
+option(ECNTT "Build ECNTT" ON)
 option(MSM "Build MSM" ON)
 option(G2 "Build G2 MSM" ON)
+option(EXT_FIELD "Build extension field" ON)
+option(HASH "Build hashes and tree builders" ON)
+option(POSEIDON "Build poseidon hash" ON)
+option(POSEIDON2 "Build poseidon2 hash" ON)
+option(SUMCHECK "Build sumcheck" ON)
+option(FRI "Build fri" ON)
+option(SANITIZE "Enable memory address sanitizer" OFF)
 
 # address sanitizer
 if(SANITIZE)
@@ -78,6 +88,16 @@ elseif(FIELD)
   check_field(${FIELD} FIELD_INDEX FEATURES_STRING)
   setup_field_target(${FIELD} ${FIELD_INDEX} ${FEATURES_STRING})
   add_compile_definitions(ICICLE_FFI_PREFIX=${FIELD})
+elseif(RING)
+  set(RING_INDEX -1)
+  set(FEATURES_STRING "")
+  check_ring(${RING} RING_INDEX FEATURES_STRING)
+  setup_ring_target(${RING} ${RING_INDEX} ${FEATURES_STRING})
+  add_compile_definitions(ICICLE_FFI_PREFIX=${RING})
+endif()
+
+if (HASH)
+  setup_hash_target()
 endif()
 
 if (CPU_BACKEND)
@@ -86,3 +106,8 @@ endif()
 
 # Include and configure (for build) backends based on the backend options
 include(cmake/backend_include.cmake)
+
+if (BUILD_TESTS)
+  add_subdirectory(tests)
+endif()
+

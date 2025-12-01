@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 icicle-core = { workspace = true }
 icicle-runtime = { workspace = true }
+icicle-hash = { workspace = true }
 serde = "1.0.219"
 
 [dev-dependencies]
@@ -23,9 +24,22 @@ cmake = "0.1.50"
 [features]
 default = []
 no_g2 = []
+no_ecntt = []
 cuda_backend = ["icicle-runtime/cuda_backend"]
 pull_cuda_backend = ["icicle-runtime/pull_cuda_backend"]
 metal_backend = ["icicle-runtime/metal_backend"]
 pull_metal_backend = ["icicle-runtime/pull_metal_backend"]
 vulkan_backend = ["icicle-runtime/vulkan_backend"]
 pull_vulkan_backend = ["icicle-runtime/pull_vulkan_backend"]
+
+[[bench]]
+name = "ntt"
+harness = false
+
+[[bench]]
+name = "msm"
+harness = false
+
+[[bench]]
+name = "ecntt"
+harness = false

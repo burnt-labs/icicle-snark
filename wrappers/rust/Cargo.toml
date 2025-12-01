@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "icicle-runtime",
   "icicle-core",
+  "icicle-hash",
   "icicle-curves/icicle-bw6-761",
   "icicle-curves/icicle-bls12-377",
   "icicle-curves/icicle-bls12-381",
@@ -11,7 +12,7 @@ members = [
 exclude = []
 
 [workspace.package]
-version = "3.8.0"
+version = "3.9.2"
 edition = "2021"
 authors = ["Ingonyama"]
 homepage = "https://www.ingonyama.com"
@@ -20,3 +21,4 @@ repository = "https://github.com/ingonyama-zk/icicle"
 [workspace.dependencies]
 icicle-core = { path = "icicle-core" }
 icicle-runtime = { path = "icicle-runtime" }
+icicle-hash = { path = "icicle-hash" }

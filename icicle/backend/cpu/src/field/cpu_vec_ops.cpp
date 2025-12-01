@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "taskflow/taskflow.hpp"
+#include "icicle/program/program.h"
+#include "cpu_program_executor.h"
 
 using namespace field_config;
 using namespace icicle;
@@ -22,6 +24,7 @@ enum VecOperation {
   VECTOR_SUB,
   VECTOR_MUL,
   VECTOR_DIV,
+  VECTOR_INV,
   CONVERT_TO_MONTGOMERY,
   CONVERT_FROM_MONTGOMERY,
   VECTOR_SUM,
@@ -29,7 +32,11 @@ enum VecOperation {
   SCALAR_ADD_VEC,
   SCALAR_SUB_VEC,
   SCALAR_MUL_VEC,
+  BIT_REVERSE,
+  SLICE,
   REPLACE_ELEMENTS,
+  OUT_OF_PLACE_MATRIX_TRANSPOSE,
+
   NOF_VECTOR_OPERATIONS
 };
 
@@ -86,6 +93,87 @@ public:
     dispatch();
   }
 
+  // Set the operands for bit_reverse operation and dispatch the task
+  void send_bit_reverse_task(
+    VecOperation operation,
+    uint32_t bit_size,
+    uint64_t start_index,
+    const uint32_t nof_operations,
+    const T* op_a,
+    const uint64_t stride,
+    T* output)
+  {
+    m_operation = operation;
+    m_bit_size = bit_size;
+    m_start_index = start_index;
+    m_nof_operations = nof_operations;
+    m_op_a = op_a;
+    m_stride = stride;
+    m_output = output;
+    dispatch();
+  }
+
+  // Set the operands for slice operation and dispatch the task
+  void send_slice_task(
+    VecOperation operation,
+    uint64_t stride,
+    uint64_t stride_out,
+    const uint32_t nof_operations,
+    const T* op_a,
+    T* output)
+  {
+    m_operation = operation;
+    m_nof_operations = nof_operations;
+    m_op_a = op_a;
+    m_output = output;
+    m_stride = stride;
+    m_stride_out = stride_out;
+    dispatch();
+  }
+
+  // Set the operands for replace_elements operation and dispatch the task
+  void send_replace_elements_task(
+    VecOperation operation,
+    const T* mat_in,
+    const uint32_t nof_operations,
+    std::vector<uint64_t>& start_indices_in_mat,
+    uint64_t start_index,
+    uint32_t log_nof_rows,
+    uint32_t log_nof_cols,
+    const uint32_t stride,
+    T* mat_out)
+  {
+    m_operation = operation;
+    m_op_a = mat_in;
+    m_nof_operations = nof_operations;
+    m_start_indices_in_mat = &start_indices_in_mat;
+    m_start_index = start_index; // start index in start_indices vector
+    m_log_nof_rows = log_nof_rows;
+    m_log_nof_cols = log_nof_cols;
+    m_stride = stride;
+    m_output = mat_out;
+    dispatch();
+  }
+
+  void send_out_of_place_matrix_transpose_task(
+    VecOperation operation,
+    const T* mat_in,
+    const uint32_t nof_operations,
+    const uint32_t nof_rows,
+    const uint32_t nof_cols,
+    const uint32_t stride,
+    T* mat_out)
+  {
+    m_operation = operation;
+    m_op_a = mat_in;
+    m_nof_operations = nof_operations;
+    m_nof_rows = nof_rows;
+    m_nof_cols = nof_cols;
+    m_stride = stride;
+    m_output = mat_out;
+    dispatch();
+  }
+
   // Execute the selected function based on m_operation
   virtual void execute() { (this->*functionPtrs[static_cast<size_t>(m_operation)])(); }
 
@@ -117,6 +205,13 @@ private:
   {
     for (uint64_t i = 0; i < m_nof_operations; ++i) {
       m_output[i] = m_op_a[i] * U::inverse(m_op_b[i]);
+    }
+  }
+  // Single worker functionality to execute vector inv (^-1)
+  void vector_inv()
+  {
+    for (uint64_t i = 0; i < m_nof_operations; ++i) {
+      m_output[i] = T::inverse(m_op_a[i]);
     }
   }
   // Single worker functionality to execute conversion from barret to montgomery
@@ -170,6 +265,39 @@ private:
       m_output[m_stride * i] = *m_op_a * m_op_b[m_stride * i];
     }
   }
+  // Single worker functionality to execute bit reverse reorder
+  void bit_reverse()
+  {
+    for (uint64_t i = 0; i < m_nof_operations; ++i) {
+      uint64_t idx = m_start_index + i;     // original index
+      uint64_t rev_idx = m_start_index + i; // reverse index
+      // Bit reverse the iundex for 64 bits
+      rev_idx = ((rev_idx >> 1) & 0x5555555555555555) | ((rev_idx & 0x5555555555555555) << 1); // bit rev single bits
+      rev_idx = ((rev_idx >> 2) & 0x3333333333333333) | ((rev_idx & 0x3333333333333333) << 2); // bit rev 2 bits chunk
+      rev_idx = ((rev_idx >> 4) & 0x0F0F0F0F0F0F0F0F) | ((rev_idx & 0x0F0F0F0F0F0F0F0F) << 4); // bit rev 4 bits chunk
+      rev_idx = ((rev_idx >> 8) & 0x00FF00FF00FF00FF) | ((rev_idx & 0x00FF00FF00FF00FF) << 8); // bit rev 8 bits chunk
+      rev_idx =
+        ((rev_idx >> 16) & 0x0000FFFF0000FFFF) | ((rev_idx & 0x0000FFFF0000FFFF) << 16); // bit rev 16 bits chunk
+      rev_idx = (rev_idx >> 32) | (rev_idx << 32);                                       // bit rev 32 bits chunk
+      rev_idx = rev_idx >> (64 - m_bit_size);                                            // Align rev_idx to the LSB
+
+      if (m_output == m_op_a) { // inplace calculation
+        if (rev_idx < idx) {    // only on of the threads need to work
+          std::swap(m_output[m_stride * idx], m_output[m_stride * rev_idx]);
+        }
+      } else {                                                 // out of place calculation
+        m_output[m_stride * idx] = m_op_a[m_stride * rev_idx]; // set index value
+      }
+    }
+  }
+
+  // Single worker functionality to execute slice
+  void slice()
+  {
+    for (uint64_t i = 0; i < m_nof_operations; ++i) {
+      m_output[i * m_stride_out] = m_op_a[i * m_stride];
+    }
+  }
 
   // Function to perform modulus with Mersenne number
   uint64_t mersenne_mod(uint64_t shifted_idx, uint32_t total_bits)
@@ -182,6 +310,35 @@ private:
     return shifted_idx;
   }
 
+  // Single worker functionality to execute replace elements
+  void replace_elements()
+  {
+    const uint32_t total_bits = m_log_nof_rows + m_log_nof_cols;
+    for (uint32_t i = 0; i < m_nof_operations; ++i) {
+      uint64_t start_idx = (*m_start_indices_in_mat)[m_start_index + i];
+      uint64_t idx = start_idx;
+      T prev = m_op_a[m_stride * idx];
+      do {
+        uint64_t shifted_idx = idx << m_log_nof_rows;
+        uint64_t new_idx = mersenne_mod(shifted_idx, total_bits);
+        T next = m_op_a[m_stride * new_idx];
+        m_output[m_stride * new_idx] = prev;
+        prev = next;
+        idx = new_idx;
+      } while (idx != start_idx);
+    }
+  }
+
+  // Single worker functionality for out of place matrix transpose
+  void out_of_place_transpose()
+  {
+    for (uint32_t k = 0; k < m_nof_operations; ++k) {
+      for (uint32_t j = 0; j < m_nof_cols; ++j) {
+        m_output[m_stride * (j * m_nof_rows + k)] = m_op_a[m_stride * (k * m_nof_cols + j)];
+      }
+    }
+  }
+
   // An array of available function pointers arranged according to the VecOperation enum
   using FunctionPtr = void (VectorOpTask::*)();
   static constexpr std::array<FunctionPtr, static_cast<int>(NOF_VECTOR_OPERATIONS)> functionPtrs = {
@@ -189,6 +346,7 @@ private:
     &VectorOpTask::vector_sub,              // VECTOR_SUB,
     &VectorOpTask::vector_mul,              // VECTOR_MUL,
     &VectorOpTask::vector_div,              // VECTOR_DIV,
+    &VectorOpTask::vector_inv,              // VECTOR_INV,
     &VectorOpTask::convert_to_montgomery,   // CONVERT_TO_MONTGOMERY,
     &VectorOpTask::convert_from_montgomery, // CONVERT_FROM_MONTGOMERY,
     &VectorOpTask::vector_sum,              // VECTOR_SUM
@@ -196,6 +354,11 @@ private:
     &VectorOpTask::scalar_add_vec,          // SCALAR_ADD_VEC,
     &VectorOpTask::scalar_sub_vec,          // SCALAR_SUB_VEC,
     &VectorOpTask::scalar_mul_vec,          // SCALAR_MUL_VEC,
+    &VectorOpTask::bit_reverse,             // BIT_REVERSE
+    &VectorOpTask::slice,                   // SLICE
+    &VectorOpTask::replace_elements,        // REPLACE_ELEMENTS
+    &VectorOpTask::out_of_place_transpose   // OUT_OF_PLACE_MATRIX_TRANSPOSE
+
   };
 
   VecOperation m_operation;  // the operation to execute
@@ -321,6 +484,15 @@ eIcicleError cpu_vector_div(
 }
 
 REGISTER_VECTOR_DIV_BACKEND("CPU", cpu_vector_div<scalar_t>);
+
+/*********************************** INV ***********************************/
+template <typename T>
+eIcicleError cpu_vector_inv(const Device& device, const T* vec_a, uint64_t size, const VecOpsConfig& config, T* output)
+{
+  return cpu_2vectors_op(VecOperation::VECTOR_INV, vec_a, vec_a, size, config, output);
+}
+
+REGISTER_VECTOR_INV_BACKEND("CPU", cpu_vector_inv<scalar_t>);
 
 /*********************************** CONVERT MONTGOMERY ***********************************/
 template <typename T>
@@ -451,3 +623,452 @@ eIcicleError cpu_scalar_mul(
 }
 
 REGISTER_SCALAR_MUL_VEC_BACKEND("CPU", cpu_scalar_mul<scalar_t>);
+
+/*********************************** TRANSPOSE ***********************************/
+
+template <typename T>
+eIcicleError out_of_place_matrix_transpose(
+  const Device& device, const T* mat_in, uint32_t nof_rows, uint32_t nof_cols, const VecOpsConfig& config, T* mat_out)
+{
+  TasksManager<VectorOpTask<T, T>> task_manager(get_nof_workers(config));
+  uint32_t stride = config.columns_batch ? config.batch_size : 1;
+  const uint64_t total_elements_one_mat = static_cast<uint64_t>(nof_rows) * nof_cols;
+  const uint32_t NOF_ROWS_PER_TASK =
+    std::min((uint64_t)nof_rows, std::max((uint64_t)(NOF_OPERATIONS_PER_TASK / nof_cols), (uint64_t)1));
+  for (uint32_t idx_in_batch = 0; idx_in_batch < config.batch_size; idx_in_batch++) {
+    const T* cur_mat_in = config.columns_batch ? mat_in + idx_in_batch : mat_in + idx_in_batch * total_elements_one_mat;
+    T* cur_mat_out = config.columns_batch ? mat_out + idx_in_batch : mat_out + idx_in_batch * total_elements_one_mat;
+    // Perform the matrix transpose
+    for (uint32_t i = 0; i < nof_rows; i += NOF_ROWS_PER_TASK) {
+      VectorOpTask<T, T>* task_p = task_manager.get_idle_or_completed_task();
+      task_p->send_out_of_place_matrix_transpose_task(
+        OUT_OF_PLACE_MATRIX_TRANSPOSE, cur_mat_in + stride * i * nof_cols,
+        std::min((uint64_t)NOF_ROWS_PER_TASK, (uint64_t)nof_rows - i), nof_rows, nof_cols, stride,
+        cur_mat_out + (stride * i));
+    }
+  }
+  task_manager.wait_done();
+  return eIcicleError::SUCCESS;
+}
+
+uint32_t gcd(uint32_t a, uint32_t b)
+{
+  while (b != 0) {
+    uint32_t temp = b;
+    b = a % b;
+    a = temp;
+  }
+  return a;
+}
+
+// Recursive function to generate all k-ary necklaces and to replace the elements within the necklaces
+template <typename T>
+void gen_necklace(
+  uint32_t t,
+  uint32_t p,
+  uint32_t k,
+  uint32_t length,
+  std::vector<uint32_t>& necklace,
+  std::vector<uint64_t>& task_indices)
+{
+  if (t > length) {
+    if (
+      length % p == 0 &&
+      !std::all_of(necklace.begin() + 1, necklace.begin() + length + 1, [first_element = necklace[1]](uint32_t x) {
+        return x == first_element;
+      })) {
+      uint32_t start_idx = 0;
+      uint64_t multiplier = 1;
+      for (int i = length; i >= 1; --i) { // Compute start_idx as the decimal representation of the necklace
+        start_idx += necklace[i] * multiplier;
+        multiplier *= k;
+      }
+      task_indices.push_back(start_idx);
+    }
+    return;
+  }
+
+  necklace[t] = necklace[t - p];
+  gen_necklace<T>(t + 1, p, k, length, necklace, task_indices);
+
+  for (int i = necklace[t - p] + 1; i < k; ++i) {
+    necklace[t] = i;
+    gen_necklace<T>(t + 1, t, k, length, necklace, task_indices);
+  }
+}
+
+template <typename T>
+eIcicleError matrix_transpose_necklaces(
+  const T* mat_in, uint32_t nof_rows, uint32_t nof_cols, const VecOpsConfig& config, T* mat_out)
+{
+  uint32_t log_nof_rows = static_cast<uint32_t>(std::floor(std::log2(nof_rows)));
+  uint32_t log_nof_cols = static_cast<uint32_t>(std::floor(std::log2(nof_cols)));
+  uint32_t gcd_value = gcd(log_nof_rows, log_nof_cols);
+  uint32_t k = 1 << gcd_value; // Base of necklaces
+  uint32_t length =
+    (log_nof_cols + log_nof_rows) / gcd_value; // length of necklaces. Since all are powers of 2, equivalent to
+                                               // (log_nof_cols + log_nof_rows) / gcd_value;
+  const uint64_t max_nof_operations = NOF_OPERATIONS_PER_TASK / length;
+  const uint64_t total_elements_one_mat = static_cast<uint64_t>(nof_rows) * nof_cols;
+
+  std::vector<uint32_t> necklace(length + 1, 0);
+  std::vector<uint64_t> start_indices_in_mat; // Collect start indices
+  gen_necklace<T>(1, 1, k, length, necklace, start_indices_in_mat);
+
+  TasksManager<VectorOpTask<T, T>> task_manager(get_nof_workers(config));
+  for (uint64_t i = 0; i < start_indices_in_mat.size(); i += max_nof_operations) {
+    uint64_t nof_operations = std::min((uint64_t)max_nof_operations, start_indices_in_mat.size() - i);
+    for (uint64_t idx_in_batch = 0; idx_in_batch < config.batch_size; idx_in_batch++) {
+      VectorOpTask<T, T>* task_p = task_manager.get_idle_or_completed_task();
+      task_p->send_replace_elements_task(
+        REPLACE_ELEMENTS, config.columns_batch ? mat_in + idx_in_batch : mat_in + idx_in_batch * total_elements_one_mat,
+        nof_operations, start_indices_in_mat, i, log_nof_rows, log_nof_cols,
+        config.columns_batch ? config.batch_size : 1,
+        config.columns_batch ? mat_out + idx_in_batch : mat_out + idx_in_batch * total_elements_one_mat);
+    }
+  }
+  task_manager.wait_done();
+  return eIcicleError::SUCCESS;
+}
+
+template <typename T>
+eIcicleError cpu_matrix_transpose(
+  const Device& device, const T* mat_in, uint32_t nof_rows, uint32_t nof_cols, const VecOpsConfig& config, T* mat_out)
+{
+  ICICLE_ASSERT(mat_in && mat_out && nof_rows != 0 && nof_cols != 0) << "Invalid argument";
+
+  // check if the number of rows and columns are powers of 2, if not use the basic transpose
+  bool is_power_of_2 = (nof_rows & (nof_rows - 1)) == 0 && (nof_cols & (nof_cols - 1)) == 0;
+  bool is_inplace = mat_in == mat_out;
+  if (!is_inplace) {
+    return (out_of_place_matrix_transpose(device, mat_in, nof_rows, nof_cols, config, mat_out));
+  } else if (is_power_of_2) {
+    return (matrix_transpose_necklaces<T>(mat_in, nof_rows, nof_cols, config, mat_out));
+  } else {
+    ICICLE_LOG_ERROR << "Matrix transpose is not supported for inplace non power of 2 rows and columns";
+    return eIcicleError::INVALID_ARGUMENT;
+  }
+}
+
+REGISTER_MATRIX_TRANSPOSE_BACKEND("CPU", cpu_matrix_transpose<scalar_t>);
+
+/*********************************** BIT REVERSE ***********************************/
+template <typename T>
+eIcicleError
+cpu_bit_reverse(const Device& device, const T* vec_in, uint64_t size, const VecOpsConfig& config, T* vec_out)
+{
+  ICICLE_ASSERT(vec_in && vec_out && size != 0) << "Invalid argument";
+
+  uint32_t logn = static_cast<uint32_t>(std::floor(std::log2(size)));
+  ICICLE_ASSERT((1ULL << logn) == size) << "Invalid argument - size is not a power of 2";
+
+  // Perform the bit reverse
+  TasksManager<VectorOpTask<T, T>> task_manager(get_nof_workers(config));
+  for (uint64_t idx_in_batch = 0; idx_in_batch < config.batch_size; idx_in_batch++) {
+    for (uint64_t i = 0; i < size; i += NOF_OPERATIONS_PER_TASK) {
+      VectorOpTask<T, T>* task_p = task_manager.get_idle_or_completed_task();
+
+      task_p->send_bit_reverse_task(
+        BIT_REVERSE, logn, i, std::min((uint64_t)NOF_OPERATIONS_PER_TASK, size - i),
+        config.columns_batch ? vec_in + idx_in_batch : vec_in + idx_in_batch * size,
+        config.columns_batch ? config.batch_size : 1,
+        config.columns_batch ? vec_out + idx_in_batch : vec_out + idx_in_batch * size);
+    }
+  }
+  task_manager.wait_done();
+  return eIcicleError::SUCCESS;
+}
+
+REGISTER_BIT_REVERSE_BACKEND("CPU", cpu_bit_reverse<scalar_t>);
+
+/*********************************** SLICE ***********************************/
+
+template <typename T>
+eIcicleError cpu_slice(
+  const Device& device,
+  const T* vec_in,
+  uint64_t offset,
+  uint64_t stride,
+  uint64_t size_in,
+  uint64_t size_out,
+  const VecOpsConfig& config,
+  T* vec_out)
+{
+  ICICLE_ASSERT(vec_in != nullptr && vec_out != nullptr) << "Error: Invalid argument - input or output vector is null";
+  ICICLE_ASSERT(offset + (size_out - 1) * stride < size_in) << "Error: Invalid argument - slice out of bound";
+
+  TasksManager<VectorOpTask<T, T>> task_manager(get_nof_workers(config));
+  for (uint64_t idx_in_batch = 0; idx_in_batch < config.batch_size; idx_in_batch++) {
+    for (uint64_t i = 0; i < size_out; i += NOF_OPERATIONS_PER_TASK) {
+      VectorOpTask<T, T>* task_p = task_manager.get_idle_or_completed_task();
+      task_p->send_slice_task(
+        SLICE, config.columns_batch ? stride * config.batch_size : stride, config.columns_batch ? config.batch_size : 1,
+        std::min((uint64_t)NOF_OPERATIONS_PER_TASK, size_out - i),
+        config.columns_batch ? vec_in + idx_in_batch + (offset + i * stride) * config.batch_size
+                             : vec_in + idx_in_batch * size_in + offset + i * stride,
+        config.columns_batch ? vec_out + idx_in_batch + i * config.batch_size : vec_out + idx_in_batch * size_out + i);
+    }
+  }
+  task_manager.wait_done();
+  return eIcicleError::SUCCESS;
+}
+
+REGISTER_SLICE_BACKEND("CPU", cpu_slice<scalar_t>);
+
+/*********************************** Highest non-zero idx ***********************************/
+template <typename T>
+eIcicleError cpu_highest_non_zero_idx_internal(
+  const Device& device,
+  const T* input,
+  uint64_t size,
+  const VecOpsConfig& config,
+  int64_t* out_idx /*OUT*/,
+  int32_t idx_in_batch_to_calc)
+{
+  ICICLE_ASSERT(input && out_idx && size != 0) << "Error: Invalid argument";
+  uint64_t stride = config.columns_batch ? config.batch_size : 1;
+  uint32_t start_idx = (idx_in_batch_to_calc == -1) ? 0 : idx_in_batch_to_calc;
+  uint32_t end_idx = (idx_in_batch_to_calc == -1) ? config.batch_size : idx_in_batch_to_calc + 1;
+  for (uint64_t idx_in_batch = start_idx; idx_in_batch < end_idx; ++idx_in_batch) {
+    out_idx[idx_in_batch] = -1; // zero vector is considered '-1' since 0 would be zero in vec[0]
+    const T* curr_input =
+      config.columns_batch ? input + idx_in_batch : input + idx_in_batch * size; // Pointer to the current vector
+    for (int64_t i = size - 1; i >= 0; --i) {
+      if (curr_input[i * stride] != T::zero()) {
+        out_idx[idx_in_batch] = i;
+        break;
+      }
+    }
+  }
+  return eIcicleError::SUCCESS;
+}
+
+template <typename T>
+eIcicleError cpu_highest_non_zero_idx(
+  const Device& device, const T* input, uint64_t size, const VecOpsConfig& config, int64_t* out_idx /*OUT*/)
+{
+  return cpu_highest_non_zero_idx_internal(device, input, size, config, out_idx, -1);
+}
+
+REGISTER_HIGHEST_NON_ZERO_IDX_BACKEND("CPU", cpu_highest_non_zero_idx<scalar_t>);
+
+/*********************************** Execute program ***********************************/
+template <typename T>
+eIcicleError cpu_execute_program(
+  const Device& device, std::vector<T*>& data, const Program<T>& program, uint64_t size, const VecOpsConfig& config)
+{
+  if (data.size() != program.m_nof_parameters) {
+    ICICLE_LOG_ERROR << "Program has " << program.m_nof_parameters << " while data has " << data.size()
+                     << " parameters";
+    return eIcicleError::INVALID_ARGUMENT;
+  }
+  tf::Taskflow taskflow; // Accumulate tasks
+  tf::Executor executor; // execute all tasks accumulated on multiple threads
+  const uint64_t total_nof_operations = size * config.batch_size;
+
+  // Divide the problem to workers
+  const int nof_workers = get_nof_workers(config);
+  const uint64_t worker_task_size = (total_nof_operations + nof_workers - 1) / nof_workers; // round up
+
+  for (uint64_t start_idx = 0; start_idx < total_nof_operations; start_idx += worker_task_size) {
+    taskflow.emplace([=]() {
+      CpuProgramExecutor prog_executor(program);
+      // init prog_executor to point to data vectors
+      for (int param_idx = 0; param_idx < program.m_nof_parameters; ++param_idx) {
+        prog_executor.m_variable_ptrs[param_idx] = &(data[param_idx][start_idx]);
+      }
+
+      const uint64_t task_size = std::min(worker_task_size, total_nof_operations - start_idx);
+      // run over all task elements in the arrays and execute the program
+      for (uint64_t i = 0; i < task_size; i++) {
+        prog_executor.execute();
+        // update the program pointers
+        for (int param_idx = 0; param_idx < program.m_nof_parameters; ++param_idx) {
+          (prog_executor.m_variable_ptrs[param_idx])++;
+        }
+      }
+    });
+  }
+
+  executor.run(taskflow).wait();
+  taskflow.clear();
+  return eIcicleError::SUCCESS;
+}
+
+REGISTER_EXECUTE_PROGRAM_BACKEND("CPU", cpu_execute_program<scalar_t>);
+
+/*********************************** Polynomial evaluation ***********************************/
+
+template <typename T>
+eIcicleError cpu_poly_eval(
+  const Device& device,
+  const T* coeffs,
+  uint64_t coeffs_size,
+  const T* domain,
+  uint64_t domain_size,
+  const VecOpsConfig& config,
+  T* evals /*OUT*/)
+{
+  ICICLE_ASSERT(coeffs && domain && evals && coeffs_size != 0 && domain_size != 0) << "Error: Invalid argument";
+  // using Horner's method
+  // example: ax^2+bx+c is computed as (1) r=a, (2) r=r*x+b, (3) r=r*x+c
+  uint64_t stride = config.columns_batch ? config.batch_size : 1;
+  for (uint64_t idx_in_batch = 0; idx_in_batch < config.batch_size; ++idx_in_batch) {
+    const T* curr_coeffs = config.columns_batch ? coeffs + idx_in_batch : coeffs + idx_in_batch * coeffs_size;
+    T* curr_evals = config.columns_batch ? evals + idx_in_batch : evals + idx_in_batch * domain_size;
+    for (uint64_t eval_idx = 0; eval_idx < domain_size; ++eval_idx) {
+      curr_evals[eval_idx * stride] = curr_coeffs[(coeffs_size - 1) * stride];
+      for (int64_t coeff_idx = coeffs_size - 2; coeff_idx >= 0; --coeff_idx) {
+        curr_evals[eval_idx * stride] =
+          curr_evals[eval_idx * stride] * domain[eval_idx] + curr_coeffs[coeff_idx * stride];
+      }
+    }
+  }
+  return eIcicleError::SUCCESS;
+}
+
+REGISTER_POLYNOMIAL_EVAL("CPU", cpu_poly_eval<scalar_t>);
+
+/*============================== polynomial division ==============================*/
+template <typename T>
+void school_book_division_step_cpu(T* r, T* q, const T* b, int deg_r, int deg_b, const T& lc_b_inv, uint32_t stride = 1)
+{
+  int64_t monomial = deg_r - deg_b; // monomial=1 is 'x', monomial=2 is x^2 etc.
+
+  T lc_r = r[deg_r * stride];         // leading coefficient of r
+  T monomial_coeff = lc_r * lc_b_inv; // lc_r / lc_b
+
+  // adding monomial s to q (q=q+s)
+  q[monomial * stride] = monomial_coeff;
+
+  for (int i = monomial; i <= deg_r; ++i) {
+    T b_coeff = b[(i - monomial) * stride];
+    r[i * stride] = r[i * stride] - monomial_coeff * b_coeff;
+  }
+}
+
+template <typename T>
+eIcicleError cpu_poly_divide(
+  const Device& device,
+  const T* numerator,
+  uint64_t numerator_size,
+  const T* denominator,
+  uint64_t denominator_size,
+  const VecOpsConfig& config,
+  T* q_out /*OUT*/,
+  uint64_t q_size,
+  T* r_out /*OUT*/,
+  uint64_t r_size)
+{
+  uint32_t stride = config.columns_batch ? config.batch_size : 1;
+  auto numerator_deg = std::make_unique<int64_t[]>(config.batch_size);
+  auto denominator_deg = std::make_unique<int64_t[]>(config.batch_size);
+  auto deg_r = std::make_unique<int64_t[]>(config.batch_size);
+  cpu_highest_non_zero_idx(device, numerator, numerator_size, config, numerator_deg.get());
+  cpu_highest_non_zero_idx(device, denominator, denominator_size, config, denominator_deg.get());
+  memset(r_out, 0, sizeof(T) * (r_size * config.batch_size));
+  memcpy(r_out, numerator, sizeof(T) * (numerator_size * config.batch_size));
+
+  for (uint64_t idx_in_batch = 0; idx_in_batch < config.batch_size; ++idx_in_batch) {
+    ICICLE_ASSERT(r_size >= numerator_deg[idx_in_batch] + 1)
+      << "polynomial division expects r(x) size to be similar to numerator size and higher than numerator "
+         "degree(x).\nr_size = "
+      << r_size << ", numerator_deg[" << idx_in_batch << "] = " << numerator_deg[idx_in_batch];
+    ICICLE_ASSERT(q_size >= (numerator_deg[idx_in_batch] - denominator_deg[idx_in_batch] + 1))
+      << "polynomial division expects q(x) size to be at least deg(numerator)-deg(denominator)+1.\nq_size = " << q_size
+      << ", numerator_deg[" << idx_in_batch << "] = " << numerator_deg[idx_in_batch] << ", denominator_deg["
+      << idx_in_batch << "] = " << denominator_deg[idx_in_batch];
+    const T* curr_numerator =
+      config.columns_batch ? numerator + idx_in_batch : numerator + idx_in_batch * numerator_size;
+    const T* curr_denominator =
+      config.columns_batch ? denominator + idx_in_batch : denominator + idx_in_batch * denominator_size;
+    T* curr_q_out = config.columns_batch ? q_out + idx_in_batch : q_out + idx_in_batch * q_size;
+    T* curr_r_out = config.columns_batch ? r_out + idx_in_batch : r_out + idx_in_batch * r_size;
+
+    // invert largest coeff of b
+    const T& lc_b_inv = T::inverse(curr_denominator[denominator_deg[idx_in_batch] * stride]);
+    deg_r[idx_in_batch] = numerator_deg[idx_in_batch];
+    while (deg_r[idx_in_batch] >= denominator_deg[idx_in_batch]) {
+      // each iteration is removing the largest monomial in r until deg(r)<deg(b)
+      school_book_division_step_cpu(
+        curr_r_out, curr_q_out, curr_denominator, deg_r[idx_in_batch], denominator_deg[idx_in_batch], lc_b_inv, stride);
+      // compute degree of r
+      cpu_highest_non_zero_idx_internal(device, r_out, deg_r[idx_in_batch], config, deg_r.get(), idx_in_batch);
+    }
+  }
+  return eIcicleError::SUCCESS;
+}
+
+REGISTER_POLYNOMIAL_DIVISION("CPU", cpu_poly_divide<scalar_t>);
+
+#ifdef EXT_FIELD
+REGISTER_MATRIX_TRANSPOSE_EXT_FIELD_BACKEND("CPU", cpu_matrix_transpose<extension_t>);
+REGISTER_BIT_REVERSE_EXT_FIELD_BACKEND("CPU", cpu_bit_reverse<extension_t>);
+REGISTER_SLICE_EXT_FIELD_BACKEND("CPU", cpu_slice<extension_t>);
+REGISTER_VECTOR_ADD_EXT_FIELD_BACKEND("CPU", cpu_vector_add<extension_t>);
+REGISTER_VECTOR_ACCUMULATE_EXT_FIELD_BACKEND("CPU", cpu_vector_accumulate<extension_t>);
+REGISTER_VECTOR_SUB_EXT_FIELD_BACKEND("CPU", cpu_vector_sub<extension_t>);
+REGISTER_VECTOR_MUL_EXT_FIELD_BACKEND("CPU", (cpu_vector_mul<extension_t, extension_t>));
+REGISTER_VECTOR_MIXED_MUL_BACKEND("CPU", (cpu_vector_mul<extension_t, scalar_t>));
+REGISTER_VECTOR_DIV_EXT_FIELD_BACKEND("CPU", cpu_vector_div<extension_t>);
+REGISTER_VECTOR_INV_EXT_FIELD_BACKEND("CPU", cpu_vector_inv<extension_t>);
+REGISTER_CONVERT_MONTGOMERY_EXT_FIELD_BACKEND("CPU", cpu_convert_montgomery<extension_t>);
+REGISTER_VECTOR_SUM_EXT_FIELD_BACKEND("CPU", cpu_vector_sum<extension_t>);
+REGISTER_VECTOR_PRODUCT_EXT_FIELD_BACKEND("CPU", cpu_vector_product<extension_t>);
+REGISTER_SCALAR_MUL_VEC_EXT_FIELD_BACKEND("CPU", cpu_scalar_mul<extension_t>);
+REGISTER_SCALAR_ADD_VEC_EXT_FIELD_BACKEND("CPU", cpu_scalar_add<extension_t>);
+REGISTER_SCALAR_SUB_VEC_EXT_FIELD_BACKEND("CPU", cpu_scalar_sub<extension_t>);
+REGISTER_EXECUTE_PROGRAM_EXT_FIELD_BACKEND("CPU", cpu_execute_program<extension_t>);
+#endif // EXT_FIELD
+
+#ifdef RING
+// Register APIs for rns type
+REGISTER_MATRIX_TRANSPOSE_RING_RNS_BACKEND("CPU", cpu_matrix_transpose<scalar_rns_t>);
+REGISTER_BIT_REVERSE_RING_RNS_BACKEND("CPU", cpu_bit_reverse<scalar_rns_t>);
+REGISTER_SLICE_RING_RNS_BACKEND("CPU", cpu_slice<scalar_rns_t>);
+REGISTER_VECTOR_ADD_RING_RNS_BACKEND("CPU", cpu_vector_add<scalar_rns_t>);
+REGISTER_VECTOR_ACCUMULATE_RING_RNS_BACKEND("CPU", cpu_vector_accumulate<scalar_rns_t>);
+REGISTER_VECTOR_SUB_RING_RNS_BACKEND("CPU", cpu_vector_sub<scalar_rns_t>);
+REGISTER_VECTOR_MUL_RING_RNS_BACKEND("CPU", (cpu_vector_mul<scalar_rns_t, scalar_rns_t>));
+REGISTER_VECTOR_DIV_RING_RNS_BACKEND("CPU", cpu_vector_div<scalar_rns_t>);
+REGISTER_VECTOR_INV_RING_RNS_BACKEND("CPU", cpu_vector_inv<scalar_rns_t>);
+REGISTER_CONVERT_MONTGOMERY_RING_RNS_BACKEND("CPU", cpu_convert_montgomery<scalar_rns_t>);
+REGISTER_VECTOR_SUM_RING_RNS_BACKEND("CPU", cpu_vector_sum<scalar_rns_t>);
+REGISTER_VECTOR_PRODUCT_RING_RNS_BACKEND("CPU", cpu_vector_product<scalar_rns_t>);
+REGISTER_SCALAR_MUL_VEC_RING_RNS_BACKEND("CPU", cpu_scalar_mul<scalar_rns_t>);
+REGISTER_SCALAR_ADD_VEC_RING_RNS_BACKEND("CPU", cpu_scalar_add<scalar_rns_t>);
+REGISTER_SCALAR_SUB_VEC_RING_RNS_BACKEND("CPU", cpu_scalar_sub<scalar_rns_t>);
+REGISTER_EXECUTE_PROGRAM_RING_RNS_BACKEND("CPU", cpu_execute_program<scalar_rns_t>);
+
+// RNS conversion
+template <typename SrcType, typename DstType, bool into_rns>
+eIcicleError
+cpu_convert_rns(const Device& device, const SrcType* input, uint64_t size, const VecOpsConfig& config, DstType* output)
+{
+  tf::Taskflow taskflow;
+  tf::Executor executor;
+  const uint64_t total_nof_operations = size * config.batch_size;
+
+  const int nof_workers = get_nof_workers(config);
+  const uint64_t worker_task_size = (total_nof_operations + nof_workers - 1) / nof_workers; // round up
+
+  for (uint64_t start_idx = 0; start_idx < total_nof_operations; start_idx += worker_task_size) {
+    taskflow.emplace([=]() {
+      const uint64_t end_idx = std::min(start_idx + worker_task_size, total_nof_operations);
+      for (uint64_t idx = start_idx; idx < end_idx; ++idx) {
+        if constexpr (into_rns) {
+          DstType::convert_direct_to_rns(&input[idx].limbs_storage, &output[idx].limbs_storage);
+        } else {
+          SrcType::convert_rns_to_direct(&input[idx].limbs_storage, &output[idx].limbs_storage);
+        }
+      }
+    });
+  }
+
+  executor.run(taskflow).wait();
+  taskflow.clear();
+  return eIcicleError::SUCCESS;
+}
+REGISTER_CONVERT_TO_RNS_BACKEND("CPU", (cpu_convert_rns<scalar_t, scalar_rns_t, true /*into rns*/>));
+REGISTER_CONVERT_FROM_RNS_BACKEND("CPU", (cpu_convert_rns<scalar_rns_t, scalar_t, false /*from rns*/>));
+#endif // RING

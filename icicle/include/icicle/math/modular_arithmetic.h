@@ -626,6 +626,11 @@ public:
         v = v - u;
         c = c - b;
       }
+
+#ifdef RING // only for rings, unnecessary for fields
+      // Detect Non-Invertible Cases - rings only
+      if (u == zero || v == zero) return zero; // If one side becomes 0, xs has no inverse
+#endif
     }
     return (u == one) ? b : c;
   }

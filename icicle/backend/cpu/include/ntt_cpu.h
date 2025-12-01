@@ -7,6 +7,10 @@
 
 #ifdef CURVE_ID
   #include "icicle/curves/curve_config.h"
+using namespace curve_config;
+  #define IS_ECNTT std::is_same_v<E, projective_t>
+#else
+  #define IS_ECNTT false
 #endif
 
 using namespace field_config;
@@ -475,10 +479,15 @@ namespace ntt_cpu {
   bool NttCpu<S, E>::compute_if_is_parallel(uint32_t logn, const NTTConfig<S>& config)
   {
     uint32_t log_batch_size = uint32_t(log2(config.batch_size));
-    uint32_t scalar_size = sizeof(S);
-    // for small scalars, the threshold for when it is faster to use parallel NTT is higher
-    if ((scalar_size >= 32 && (logn + log_batch_size) <= 11) || (scalar_size < 32 && (logn + log_batch_size) <= 16)) {
-      return false;
+    // For ecntt we want parallelism unless really small case
+    if constexpr (IS_ECNTT) {
+      return logn > 5;
+    } else {
+      uint32_t scalar_size = sizeof(S);
+      // for small scalars, the threshold for when it is faster to use parallel NTT is higher
+      if ((scalar_size >= 32 && (logn + log_batch_size) <= 11) || (scalar_size < 32 && (logn + log_batch_size) <= 16)) {
+        return false;
+      }
     }
     return true;
   }

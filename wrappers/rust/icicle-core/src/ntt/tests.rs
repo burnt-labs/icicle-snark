@@ -1,4 +1,5 @@
 use crate::ntt::{NttAlgorithm, Ordering, CUDA_NTT_ALGORITHM, CUDA_NTT_FAST_TWIDDLES_MODE};
+use crate::vec_ops::{transpose_matrix, VecOps, VecOpsConfig};
 use icicle_runtime::{
     memory::{DeviceVec, HostSlice},
     runtime,
@@ -267,6 +268,104 @@ where
                 test_utilities::test_set_ref_device();
                 ntt_inplace(scalars_ref, NTTDir::kInverse, &config).unwrap();
                 assert_eq!(*scalars.as_slice(), *scalars_ref.as_slice());
+            }
+        }
+    }
+}
+
+// self test, comparing batch ntt to multiple single ntts
+// also testing column batch with transpose against row batch
+pub fn check_ntt_batch<F: FieldImpl>()
+where
+    <F as FieldImpl>::Config: NTT<F, F> + GenerateRandom<F>,
+    <F as FieldImpl>::Config: VecOps<F>,
+{
+    test_utilities::test_set_main_device();
+    let test_sizes = [1 << 4, 1 << 12];
+    let batch_sizes = [1, 1 << 4, 100];
+    for test_size in test_sizes {
+        let coset_generators = [F::one(), F::Config::generate_random(1)[0]];
+        let mut config = NTTConfig::<F>::default();
+        for batch_size in batch_sizes {
+            let scalars = F::Config::generate_random(test_size * batch_size);
+            let scalars = HostSlice::from_slice(&scalars);
+
+            for coset_gen in coset_generators {
+                for is_inverse in [NTTDir::kInverse, NTTDir::kForward] {
+                    for ordering in [
+                        Ordering::kNN,
+                        Ordering::kNR,
+                        Ordering::kRN,
+                        Ordering::kRR,
+                        Ordering::kNM,
+                        Ordering::kMN,
+                    ] {
+                        config.coset_gen = coset_gen;
+                        config.ordering = ordering;
+                        let mut batch_ntt_result = vec![F::zero(); batch_size * test_size];
+                        for alg in [NttAlgorithm::Radix2, NttAlgorithm::MixedRadix] {
+                            config.batch_size = batch_size as i32;
+                            config
+                                .ext
+                                .set_int(CUDA_NTT_ALGORITHM, alg as i32);
+                            ntt(
+                                scalars,
+                                is_inverse,
+                                &config,
+                                HostSlice::from_mut_slice(&mut batch_ntt_result),
+                            )
+                            .unwrap();
+                            config.batch_size = 1;
+                            let mut one_ntt_result = vec![F::one(); test_size];
+                            for i in 0..batch_size {
+                                ntt(
+                                    &scalars[i * test_size..(i + 1) * test_size],
+                                    is_inverse,
+                                    &config,
+                                    HostSlice::from_mut_slice(&mut one_ntt_result),
+                                )
+                                .unwrap();
+                                assert_eq!(
+                                    batch_ntt_result[i * test_size..(i + 1) * test_size],
+                                    *one_ntt_result.as_slice()
+                                );
+                            }
+                        }
+
+                        let nof_rows = batch_size as u32;
+                        let nof_cols = test_size as u32;
+                        // for now, columns batching only works with MixedRadix NTT
+                        config.batch_size = batch_size as i32;
+                        config.columns_batch = true;
+                        let mut transposed_input = vec![F::zero(); batch_size * test_size];
+                        transpose_matrix(
+                            scalars,
+                            nof_rows,
+                            nof_cols,
+                            HostSlice::from_mut_slice(&mut transposed_input),
+                            &VecOpsConfig::default(),
+                        )
+                        .unwrap();
+                        let mut col_batch_ntt_result = vec![F::zero(); batch_size * test_size];
+                        ntt(
+                            HostSlice::from_slice(&transposed_input),
+                            is_inverse,
+                            &config,
+                            HostSlice::from_mut_slice(&mut col_batch_ntt_result),
+                        )
+                        .unwrap();
+                        transpose_matrix(
+                            HostSlice::from_slice(&col_batch_ntt_result),
+                            nof_cols, // inverted since it was transposed above
+                            nof_rows,
+                            HostSlice::from_mut_slice(&mut transposed_input),
+                            &VecOpsConfig::default(),
+                        )
+                        .unwrap();
+                        assert_eq!(batch_ntt_result[..], *transposed_input.as_slice());
+                        config.columns_batch = false;
+                    }
+                }
             }
         }
     }

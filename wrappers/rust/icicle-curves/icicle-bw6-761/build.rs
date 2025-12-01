@@ -25,6 +25,7 @@ fn main() {
     };
     config
         .define("CURVE", "bw6_761")
+        .define("HASH", "ON")
         .define("CMAKE_INSTALL_PREFIX", &icicle_install_dir);
 
     // build (or pull and build) cuda backend if feature enabled.
@@ -53,6 +54,7 @@ fn main() {
     println!("cargo:rustc-link-search={}/lib", icicle_install_dir.display());
     println!("cargo:rustc-link-lib=icicle_field_bw6_761");
     println!("cargo:rustc-link-lib=icicle_curve_bw6_761");
+    println!("cargo:rustc-link-lib=icicle_hash");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}/lib", icicle_install_dir.display()); // Add RPATH linker arguments
 
     // default backends dir
